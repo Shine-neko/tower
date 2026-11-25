@@ -33,6 +33,14 @@ pub struct ReconciliationDelta {
     pub removals: Vec<FileId>,
 }
 
+impl ReconciliationDelta {
+    /// Whether the delta changes nothing: applying it must write nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.additions.is_empty() && self.removals.is_empty()
+    }
+}
+
 /// Persistence contract for `VirtualFile` entities and raw content blobs.
 ///
 /// # Object safety

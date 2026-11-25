@@ -223,6 +223,12 @@ impl EventProcessor {
     }
 
     pub fn process_event(&mut self, event: WatchEvent) -> Result<(), crate::ports::PortError> {
+        // Before any staging: the daemon's own runtime files are never
+        // indexed, and processing their events would write to the database
+        // they hold, which would make another event.
+        if self.is_runtime_event(&event) {
+            return Ok(());
+        }
         if !self.coordinate_event(&event)? {
             return Ok(());
         }
@@ -293,7 +299,10 @@ impl EventProcessor {
             // the gate. Publisher metrics measure this unavoidable commit scope.
             let mut workspace = self.workspace.write().unwrap_or_else(|p| p.into_inner());
             let mut index = self.index.write().unwrap_or_else(|p| p.into_inner());
-            self.storage.apply_reconciliation_delta(&delta)?;
+            // An event that changed nothing writes nothing.
+            if !delta.is_empty() {
+                self.storage.apply_reconciliation_delta(&delta)?;
+            }
             *workspace =
                 std::mem::take(&mut *staged_workspace.write().unwrap_or_else(|p| p.into_inner()));
             *index = std::mem::take(&mut *staged_index.write().unwrap_or_else(|p| p.into_inner()));
@@ -999,6 +1008,24 @@ impl EventProcessor {
     /// Convert an absolute path to a workspace-relative [`RelativePath`].
     ///
     /// Returns `None` if the path is outside the workspace root (UN1/AC5).
+    /// Whether every path of `event` is in the workspace's `.tower/`
+    /// directory (the daemon's database, socket, logs and config): a rename
+    /// out of it still counts, as it brings a file into the workspace.
+    fn is_runtime_event(&self, event: &WatchEvent) -> bool {
+        let is_runtime = |abs: &Path| {
+            abs.strip_prefix(&self.root)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .is_some_and(|first| first.as_os_str() == ".tower")
+        };
+        match event {
+            WatchEvent::Create(path) | WatchEvent::Modify(path) | WatchEvent::Delete(path) => {
+                is_runtime(path)
+            }
+            WatchEvent::Rename { from, to } => is_runtime(from) && is_runtime(to),
+        }
+    }
+
     fn to_relative(&self, abs: &Path) -> Option<RelativePath> {
         let rel = abs.strip_prefix(&self.root).ok()?;
         let rel_str = rel.to_str()?;
@@ -2017,6 +2044,61 @@ mod tests {
         processor.process_event(WatchEvent::Create(path)).unwrap();
         assert!(workspace.read().unwrap().snapshot().files.is_empty());
         assert_eq!(publisher.capture_cut().unwrap().sequence, 2);
+    }
+
+    /// A processor publishing its commits, over storage counting the deltas
+    /// it is asked to write.
+    fn counting_processor(root: &Path) -> (EventProcessor, Arc<Mutex<ReconciliationCalls>>) {
+        let calls = Arc::new(Mutex::new(ReconciliationCalls::default()));
+        let storage = CountingFailureStorage {
+            inner: InMemoryStorage::new(),
+            calls: Arc::clone(&calls),
+        };
+        let processor = EventProcessor::new(
+            root.to_path_buf(),
+            Arc::new(RwLock::new(ProjectWorkspace::new())),
+            Arc::new(RwLock::new(InvertedIndex::new())),
+            Box::new(storage),
+            Box::new(NoOpExtensionHost),
+        )
+        .with_publication(Some(Arc::new(
+            crate::adapters::daemon::CommittedEventPublisher::new(1),
+        )));
+        (processor, calls)
+    }
+
+    /// The daemon's own runtime files (its Sled database, socket, logs)
+    /// change all the time and are never indexed: their events are dropped
+    /// before any work, or each write to the database would make another.
+    #[test]
+    fn drops_events_of_its_own_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join(".tower/db/db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"x").unwrap();
+        let (mut processor, calls) = counting_processor(root.path());
+        processor
+            .process_event(WatchEvent::Modify(db.clone()))
+            .unwrap();
+        processor.process_event(WatchEvent::Create(db)).unwrap();
+        assert_eq!(calls.lock().unwrap().attempts, 0);
+    }
+
+    /// An event that changes nothing (a hidden file never indexed) writes
+    /// nothing to storage.
+    #[test]
+    fn writes_nothing_for_an_event_that_changes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let hidden = root.path().join(".env");
+        std::fs::write(&hidden, b"x").unwrap();
+        let (mut processor, calls) = counting_processor(root.path());
+        processor.process_event(WatchEvent::Modify(hidden)).unwrap();
+        assert_eq!(calls.lock().unwrap().attempts, 0);
+        // A real change is still written.
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, b"fn f() {}").unwrap();
+        processor.process_event(WatchEvent::Create(source)).unwrap();
+        assert_eq!(calls.lock().unwrap().attempts, 1);
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
