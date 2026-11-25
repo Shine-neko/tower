@@ -104,14 +104,8 @@ where
                 let mut hashes = content_hashes.lock().unwrap();
                 hashes.insert(path.to_owned(), new_hash);
             }
-            {
-                let mut idx = index.lock().unwrap();
-                idx.index_file(path, o);
-                // Persist after indexing.
-                let bytes = idx.to_bytes();
-                drop(idx); // release lock before host call
-                let _ = protocol::host_call_index_put(out, lines, next_id, "ast/symbols", bytes);
-            }
+            // Persisted in batches by the main loop (see `persist`).
+            index.lock().unwrap().index_file(path, o);
             Ok(o.to_json())
         }
     }
@@ -150,11 +144,8 @@ where
         let mut hashes = content_hashes.lock().unwrap();
         hashes.insert(path.to_owned(), new_hash);
         drop(hashes);
-        let mut idx = index.lock().unwrap();
-        idx.index_file(path, o);
-        let bytes = idx.to_bytes();
-        drop(idx);
-        let _ = protocol::host_call_index_put(out, lines, next_id, "ast/symbols", bytes);
+        // Persisted in batches by the main loop (see `persist`).
+        index.lock().unwrap().index_file(path, o);
     }
 
     let result = symbols::find_symbols(&content, path, symbol_name, kind);
@@ -246,7 +237,7 @@ where
         .sum();
 
     // Persist the fresh index.
-    let persist_bytes = fresh_index.to_bytes();
+    let persist_bytes = fresh_index.persist();
     let _ = protocol::host_call_index_put(out, lines, next_id, "ast/symbols", persist_bytes);
 
     // Replace in-process state atomically.
@@ -781,18 +772,8 @@ where
                         let mut hashes = content_hashes.lock().unwrap();
                         hashes.insert(path.to_owned(), new_hash);
                     }
-                    let persist_bytes = {
-                        let mut idx = index.lock().unwrap();
-                        idx.index_file(path, o);
-                        idx.to_bytes()
-                    };
-                    let _ = protocol::host_call_index_put(
-                        out,
-                        lines,
-                        next_id,
-                        "ast/symbols",
-                        persist_bytes,
-                    );
+                    // Persisted in batches by the main loop (see `persist`).
+                    index.lock().unwrap().index_file(path, o);
                 }
                 OutlineResult::Unsupported { .. } => {
                     // Unsupported language: remove stale entry if present.
@@ -801,19 +782,8 @@ where
                         idx.by_path.contains_key(path)
                     };
                     if was_indexed {
-                        let persist_bytes = {
-                            let mut idx = index.lock().unwrap();
-                            idx.remove_file(path);
-                            idx.to_bytes()
-                        };
+                        index.lock().unwrap().remove_file(path);
                         content_hashes.lock().unwrap().remove(path);
-                        let _ = protocol::host_call_index_put(
-                            out,
-                            lines,
-                            next_id,
-                            "ast/symbols",
-                            persist_bytes,
-                        );
                     }
                 }
             }
@@ -826,18 +796,7 @@ where
             };
             content_hashes.lock().unwrap().remove(path);
             if was_present {
-                let persist_bytes = {
-                    let mut idx = index.lock().unwrap();
-                    idx.remove_file(path);
-                    idx.to_bytes()
-                };
-                let _ = protocol::host_call_index_put(
-                    out,
-                    lines,
-                    next_id,
-                    "ast/symbols",
-                    persist_bytes,
-                );
+                index.lock().unwrap().remove_file(path);
             }
         }
     }
