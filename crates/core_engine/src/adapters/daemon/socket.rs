@@ -304,10 +304,45 @@ fn protect_or_remove_existing_socket(workspace_root: &Path) -> Result<(), Owners
     }
 }
 
-/// `<workspace>/.tower/daemon.sock`.
+/// Longest path `sockaddr_un.sun_path` can hold (108 bytes on Linux, minus the NUL).
+const MAX_SOCKET_PATH_BYTES: usize = 107;
+
+/// `<workspace>/.tower/daemon.sock`, or `$XDG_RUNTIME_DIR/tower/<hash>.sock` when the
+/// workspace path is too long for a Unix socket address.
 #[must_use]
 pub fn socket_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".tower").join("daemon.sock")
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    socket_path_in(workspace_root, runtime_dir.as_deref())
+}
+
+fn socket_path_in(workspace_root: &Path, runtime_dir: Option<&Path>) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+
+    let in_workspace = workspace_root.join(".tower").join("daemon.sock");
+    let Some(runtime_dir) = runtime_dir.filter(|dir| dir.is_absolute()) else {
+        return in_workspace;
+    };
+    if in_workspace.as_os_str().len() <= MAX_SOCKET_PATH_BYTES {
+        return in_workspace;
+    }
+    // Hash the canonical root so every spelling of one workspace meets the same daemon.
+    let canonical = std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.into());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    runtime_dir.join("tower").join(format!("{name}.sock"))
+}
+
+/// Create the socket's parent when it lives outside `<workspace>/.tower`.
+fn ensure_socket_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    match path.parent() {
+        Some(parent) if !parent.exists() => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent),
+        _ => Ok(()),
+    }
 }
 
 /// `<workspace>/.tower/daemon.lock` — flock target for the spawn race.
@@ -349,6 +384,7 @@ fn classify_connect_result(
 /// Stale cleanup is performed once, during owner acquisition.
 pub fn bind_listener(owner: &WorkspaceDaemonOwner) -> Result<UnixListener, OwnershipError> {
     let path = socket_path(owner.workspace_root());
+    ensure_socket_dir(&path).map_err(OwnershipError::Bind)?;
     if tokio::runtime::Handle::try_current().is_ok() {
         return UnixListener::bind(path).map_err(OwnershipError::Bind);
     }
@@ -518,5 +554,54 @@ mod connect_error_tests {
             .unwrap_err();
             assert_eq!(error.raw_os_error(), Some(errno.raw_os_error()));
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    use super::*;
+
+    fn long_root() -> PathBuf {
+        PathBuf::from("/home/someone").join("deeply-nested-directory-name".repeat(4))
+    }
+
+    #[test]
+    fn short_workspace_keeps_socket_inside_tower_dir() {
+        let root = Path::new("/home/someone/project");
+        assert_eq!(
+            socket_path_in(root, Some(Path::new("/run/user/1000"))),
+            root.join(".tower").join("daemon.sock")
+        );
+    }
+
+    #[test]
+    fn long_workspace_moves_socket_to_runtime_dir_within_sun_path_limit() {
+        let runtime = Path::new("/run/user/1000");
+        let path = socket_path_in(&long_root(), Some(runtime));
+        assert!(path.starts_with(runtime.join("tower")), "got {path:?}");
+        assert!(path.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
+    }
+
+    #[test]
+    fn runtime_socket_is_stable_per_workspace_and_distinct_across_workspaces() {
+        let runtime = Some(Path::new("/run/user/1000"));
+        let root = long_root();
+        assert_eq!(
+            socket_path_in(&root, runtime),
+            socket_path_in(&root, runtime)
+        );
+        assert_ne!(
+            socket_path_in(&root, runtime),
+            socket_path_in(&root.join("other"), runtime)
+        );
+    }
+
+    #[test]
+    fn long_workspace_without_runtime_dir_keeps_workspace_socket() {
+        let root = long_root();
+        assert_eq!(
+            socket_path_in(&root, None),
+            root.join(".tower").join("daemon.sock")
+        );
     }
 }

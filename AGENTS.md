@@ -60,7 +60,8 @@ tower shutdown                               # stop the running daemon
 
 **Multi-agent model.** Each agent launches `tower mcp`, a thin stdio client that
 connects to (or spawns) a single per-workspace **daemon** holding the Sled index,
-watcher, and extensions. The daemon listens on `<workspace>/.tower/daemon.sock` and
+watcher, and extensions. The daemon listens on `<workspace>/.tower/daemon.sock` (or
+`$XDG_RUNTIME_DIR/tower/<hash>.sock` when that path exceeds the 107-byte Unix socket limit) and
 serves one MCP session per client over shared state, so several agents can drive the
 same workspace concurrently (writes stay safe via the existing `expected_version`
 CAS). The daemon self-terminates after `[daemon] idle_timeout_secs` (default 30s)

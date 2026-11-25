@@ -783,13 +783,18 @@ mod connection_error_tests {
 
     #[tokio::test]
     async fn invalid_socket_probe_does_not_spawn_a_daemon() {
-        // The invalid name cannot denote an absent/refused Unix socket. A
-        // spawn attempt would create .tower/daemon.log under this workspace.
+        // A socket path that loops (ELOOP) is neither an absent nor a refused
+        // Unix socket. A spawn attempt would create .tower/daemon.log under
+        // this workspace. (An over-long path no longer works here: it moves
+        // to $XDG_RUNTIME_DIR, see `socket_path`.)
         let workspace = tempfile::tempdir().unwrap();
-        let invalid = workspace.path().join("x".repeat(200));
-        assert!(super::connect_or_spawn(&invalid).await.is_err());
-        assert!(!invalid.join(".tower/daemon.log").exists());
-        assert!(!invalid.join(".tower/daemon.lock").exists());
+        let tower = workspace.path().join(".tower");
+        std::fs::create_dir(&tower).unwrap();
+        std::os::unix::fs::symlink("daemon.sock", tower.join("daemon.sock")).unwrap();
+        assert!(super::connect_or_spawn(workspace.path()).await.is_err());
+        assert!(!tower.join("daemon.log").exists());
+        assert!(!tower.join("daemon.lock").exists());
+        assert!(tower.join("daemon.sock").symlink_metadata().is_ok());
     }
 }
 
