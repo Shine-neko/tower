@@ -10,9 +10,11 @@
 //!    for each FileId:
 //!      path = workspace.get(file_id).path
 //!      bytes = fs_port.read(path)             (through FileSystemPort — DI)
-//!          ├── NotFound / ReadFailed  → skip  (UN1)
-//!          └── non-UTF-8             → skip   (UN2, policy: skip binary)
-//!      scan lines for literal substring match
+//!          └── NotFound / ReadFailed  → skip  (UN1)
+//!      SIMD scan of the bytes for the pattern (memchr::memmem)
+//!          ├── no occurrence          → done (most files: one scan)
+//!          └── occurrences            → their lines, as `lines()` splits them
+//!                                       non-UTF-8 file → skip (UN2, policy: skip binary)
 //!          │ early-stop when AtomicUsize cap reached (OP1)
 //!          ▼
 //!      collect Match { path, line_number (1-based), line_content, file_id }
@@ -26,8 +28,11 @@
 //! **Pattern matching — literal substring (YAGNI)**
 //!
 //! The spec permits literal+regex via the `regex` crate but does not require it.
-//! Literal `str::contains` is sufficient for spec 07 acceptance criteria and
-//! avoids a ~3 MB transitive dependency. Regex support is deferred to the spec
+//! A literal substring is sufficient for spec 07 acceptance criteria and
+//! avoids a ~3 MB transitive dependency. It is found in a file's bytes with
+//! `memchr::memmem` rather than line by line with `str::contains`: the file is
+//! split into lines, and checked to be UTF-8, only when it holds the pattern,
+//! with the very lines and line numbers `lines()` + `contains` would give. Regex support is deferred to the spec
 //! that explicitly requires it.
 //!
 //! **Determinism — sort by `(path, line_number)` before returning**
@@ -149,6 +154,9 @@ impl<'a> TextSearch<'a> {
         // so &AtomicUsize is Send + Sync. No heap allocation needed.
         let counter = AtomicUsize::new(0);
         let effective_cap = cap.unwrap_or(usize::MAX);
+        // Built once, shared by the workers: SIMD substring search over a
+        // file's bytes, so a file without the pattern is scanned once.
+        let finder = memchr::memmem::Finder::new(pattern.as_bytes());
 
         let mut matches: Vec<Match> = file_ids
             .par_iter()
@@ -171,39 +179,43 @@ impl<'a> TextSearch<'a> {
                     Err(_) => return vec![],
                 };
 
-                // Convert to UTF-8 — skip binary files (UN2, policy: skip).
-                let text = match std::str::from_utf8(&bytes) {
-                    Ok(t) => t,
-                    Err(_) => return vec![],
-                };
+                // The lines holding the pattern, found in the bytes; most
+                // files have none and cost only that scan.
+                let lines = matching_lines(&bytes, &finder, pattern.as_bytes());
+                if lines.is_empty() {
+                    return vec![];
+                }
+                // Skip binary files (UN2, policy: skip): checked only for the
+                // files that match, as the whole file must be UTF-8.
+                if std::str::from_utf8(&bytes).is_err() {
+                    return vec![];
+                }
 
-                // Scan lines for the pattern, collecting matches.
                 let mut file_matches: Vec<Match> = Vec::new();
-                for (zero_idx, line) in text.lines().enumerate() {
+                for (zero_idx, line) in lines {
                     if counter.load(Ordering::Relaxed) >= effective_cap {
                         break;
                     }
-                    if line.contains(pattern) {
-                        if counter
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                                (current < effective_cap).then_some(current + 1)
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        // Saturate at u32::MAX rather than panicking in a Rayon
-                        // worker thread (UN2 / panic-free contract). A file with
-                        // 4 billion lines is pathological; saturating is correct
-                        // enough for any real input.
-                        let line_number = (zero_idx as u64 + 1).min(u64::from(u32::MAX)) as u32;
-                        file_matches.push(Match {
-                            path: path.clone(),
-                            line_number,
-                            line_content: line.to_owned(),
-                            file_id,
-                        });
+                    if counter
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            (current < effective_cap).then_some(current + 1)
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
+                    // Saturate at u32::MAX rather than panicking in a Rayon
+                    // worker thread (UN2 / panic-free contract). A file with
+                    // 4 billion lines is pathological; saturating is correct
+                    // enough for any real input.
+                    let line_number = (zero_idx as u64 + 1).min(u64::from(u32::MAX)) as u32;
+                    file_matches.push(Match {
+                        path: path.clone(),
+                        line_number,
+                        // Valid: the file is, and lines end at ASCII bytes.
+                        line_content: String::from_utf8_lossy(line).into_owned(),
+                        file_id,
+                    });
                 }
                 file_matches
             })
@@ -214,6 +226,55 @@ impl<'a> TextSearch<'a> {
         matches.sort();
         Ok(matches)
     }
+}
+
+/// The lines of `bytes` holding `pattern`, as `str::lines` splits them (on
+/// `\n`, a `\r` right before it taken off) and `str::contains` matches them:
+/// their zero-based index and bytes. Only the lines around an occurrence
+/// `finder` finds are looked at, so a file without the pattern costs a
+/// single SIMD scan. The empty pattern matches every line.
+fn matching_lines<'t>(
+    bytes: &'t [u8],
+    finder: &memchr::memmem::Finder<'_>,
+    pattern: &[u8],
+) -> Vec<(usize, &'t [u8])> {
+    let mut found = Vec::new();
+    let (mut line_start, mut line_index, mut from) = (0, 0, 0);
+    while from < bytes.len() {
+        let at = if pattern.is_empty() {
+            from
+        } else {
+            match finder.find(&bytes[from..]) {
+                Some(offset) => from + offset,
+                None => break,
+            }
+        };
+        // Move to the line holding the occurrence.
+        let skipped = &bytes[line_start..at];
+        line_index += memchr::memchr_iter(b'\n', skipped).count();
+        if let Some(last) = memchr::memrchr(b'\n', skipped) {
+            line_start += last + 1;
+        }
+        let end = memchr::memchr(b'\n', &bytes[at..]).map_or(bytes.len(), |i| at + i);
+        let mut line = &bytes[line_start..end];
+        if end < bytes.len()
+            && let Some(stripped) = line.strip_suffix(b"\r")
+        {
+            line = stripped;
+        }
+        // The occurrence may span the line's end (a pattern holding `\n`, or
+        // `\r` before it): the line itself must hold the pattern.
+        if pattern.is_empty() || finder.find(line).is_some() {
+            found.push((line_index, line));
+        }
+        if end == bytes.len() {
+            break;
+        }
+        line_start = end + 1;
+        line_index += 1;
+        from = end + 1;
+    }
+    found
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -516,6 +577,67 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].path, path("readable.rs"));
         assert_eq!(result.matches[0].origin, SearchResultOrigin::Workspace);
+    }
+
+    // ── Scanning bytes for the pattern, as `str::lines` + `contains` would ──
+
+    /// The search's former scan, kept as the oracle of [`matching_lines`].
+    fn reference(text: &str, pattern: &str) -> Vec<(usize, String)> {
+        text.lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(pattern))
+            .map(|(i, line)| (i, line.to_owned()))
+            .collect()
+    }
+
+    /// Lines found by scanning the bytes are the ones `lines()` + `contains`
+    /// finds: line endings `\n` and `\r\n`, a bare `\r`, no final newline,
+    /// several matches on a line, patterns holding `\r` or `\n`, the empty
+    /// pattern, and multi-byte characters.
+    #[test]
+    fn scanning_bytes_finds_the_lines_contains_finds() {
+        let texts = [
+            "",
+            "\n",
+            "\n\n",
+            "needle",
+            "needle\n",
+            "a needle b needle c\nno\nneedle",
+            "x\r\nneedle\r\ny\r\n",
+            "needle\r",
+            "needle\r\r\n",
+            "a\rneedle\rb\n",
+            "line\r\n\r\nneedle\r\n\r\n",
+            "é needle ü\nneedleneedle\n日本 needle",
+            "needl\needle\n",
+        ];
+        let patterns = [
+            "needle",
+            "\r",
+            "e\r",
+            "\n",
+            "e\ne",
+            "",
+            "l\r",
+            "日本",
+            "zzz",
+            "needleneedle",
+        ];
+        for text in texts {
+            for pattern in patterns {
+                let finder = memchr::memmem::Finder::new(pattern);
+                let found: Vec<(usize, String)> =
+                    matching_lines(text.as_bytes(), &finder, pattern.as_bytes())
+                        .into_iter()
+                        .map(|(i, line)| (i, String::from_utf8(line.to_vec()).unwrap()))
+                        .collect();
+                assert_eq!(
+                    found,
+                    reference(text, pattern),
+                    "text {text:?}, pattern {pattern:?}"
+                );
+            }
+        }
     }
 
     // ── TDD step 1/2: single-file match with line numbers ────────────────────
