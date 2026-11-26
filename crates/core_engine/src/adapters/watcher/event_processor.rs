@@ -259,20 +259,18 @@ impl EventProcessor {
 
             // Event handlers work on an isolated allocator/index and stage storage
             // writes. Only the successful atomic delta makes that state visible.
-            let snapshot = self
-                .workspace
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .snapshot();
+            // Both are read under their locks together, in the writers' order:
+            // every writer changes them together, so the copies agree.
+            let (snapshot, staged_index) = {
+                let workspace = self.workspace.read().unwrap_or_else(|p| p.into_inner());
+                let index = self.index.read().unwrap_or_else(|p| p.into_inner());
+                (workspace.snapshot(), index.clone())
+            };
             let staged_workspace =
                 ProjectWorkspace::from_snapshot(snapshot).expect("valid live workspace snapshot");
             #[cfg(test)]
             {
                 self.stagings += 1;
-            }
-            let mut staged_index = InvertedIndex::new();
-            for file in staged_workspace.snapshot().files {
-                staged_index.insert(file.id, &tokenize(file.path.as_str()));
             }
             let workspace =
                 std::mem::replace(&mut self.workspace, Arc::new(RwLock::new(staged_workspace)));
@@ -2064,6 +2062,7 @@ mod tests {
         );
         assert!(workspace.read().unwrap().snapshot().files.is_empty());
         assert_eq!(publisher.capture_cut().unwrap().sequence, 0);
+        assert_eq!(*index.read().unwrap(), InvertedIndex::new());
         processor
             .process_event(WatchEvent::Create(path.clone()))
             .unwrap();
@@ -2081,6 +2080,58 @@ mod tests {
         processor.process_event(WatchEvent::Create(path)).unwrap();
         assert!(workspace.read().unwrap().snapshot().files.is_empty());
         assert_eq!(publisher.capture_cut().unwrap().sequence, 2);
+    }
+
+    /// The path index the workspace's files make.
+    fn path_index_of(workspace: &ProjectWorkspace) -> InvertedIndex {
+        let mut index = InvertedIndex::new();
+        for file in workspace.snapshot().files {
+            index.insert(file.id, &tokenize(file.path.as_str()));
+        }
+        index
+    }
+
+    /// After every committed event the live index is exactly the path index
+    /// of the live workspace, whatever the event did.
+    #[test]
+    fn committed_index_is_the_path_index_of_the_committed_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut processor, _) = counting_processor(root.path());
+        let at = |name: &str| root.path().join(name);
+        std::fs::write(at("alpha.rs"), "fn a() {}").unwrap();
+        std::fs::write(at("beta_client.rs"), "fn b() {}").unwrap();
+        let mut steps: Vec<Box<dyn FnOnce() -> WatchEvent>> = vec![
+            Box::new(|| WatchEvent::Create(at("alpha.rs"))),
+            Box::new(|| WatchEvent::Create(at("beta_client.rs"))),
+            Box::new(|| {
+                std::fs::write(at("alpha.rs"), "fn a() { 1 }").unwrap();
+                WatchEvent::Modify(at("alpha.rs"))
+            }),
+            Box::new(|| {
+                std::fs::rename(at("alpha.rs"), at("gamma_server.rs")).unwrap();
+                WatchEvent::Rename {
+                    from: at("alpha.rs"),
+                    to: at("gamma_server.rs"),
+                }
+            }),
+            Box::new(|| {
+                std::fs::remove_file(at("beta_client.rs")).unwrap();
+                WatchEvent::Delete(at("beta_client.rs"))
+            }),
+            Box::new(|| {
+                std::fs::write(at("beta_client.rs"), "fn again() {}").unwrap();
+                WatchEvent::Create(at("beta_client.rs"))
+            }),
+        ];
+        for step in steps.drain(..) {
+            processor.process_event(step()).unwrap();
+            let workspace = processor.workspace.read().unwrap();
+            assert_eq!(*processor.index.read().unwrap(), path_index_of(&workspace));
+        }
+        assert_eq!(
+            processor.workspace.read().unwrap().snapshot().files.len(),
+            2
+        );
     }
 
     /// A processor publishing its commits, over storage counting the deltas

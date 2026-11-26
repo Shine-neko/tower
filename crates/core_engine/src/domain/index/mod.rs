@@ -64,6 +64,7 @@
 pub mod search;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::file_id::FileId;
 use super::token::Token;
@@ -96,14 +97,16 @@ pub use search::FileSearch;
 /// let count = index.query(&Token::new("client")).count();
 /// assert_eq!(count, 1);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InvertedIndex {
     /// Token → set of FileIds containing that token.
     ///
     /// Decision: HashMap outer, HashSet<FileId> inner.
     /// FileId includes generation, so a reused slot produces a distinct key;
     /// no aliasing possible between old and new inhabitants of the same slot.
-    map: HashMap<Token, HashSet<FileId>>,
+    /// Sets are shared copy-on-write, so a clone (a staged copy of the live
+    /// index) copies only the token table and later only the sets it changes.
+    map: HashMap<Token, Arc<HashSet<FileId>>>,
 }
 
 impl InvertedIndex {
@@ -118,7 +121,10 @@ impl InvertedIndex {
     /// Idempotent per `(file_id, token)` pair.
     pub fn insert(&mut self, file_id: FileId, tokens: &[Token]) {
         for token in tokens {
-            self.map.entry(token.clone()).or_default().insert(file_id);
+            let ids = self.map.entry(token.clone()).or_default();
+            if !ids.contains(&file_id) {
+                Arc::make_mut(ids).insert(file_id);
+            }
         }
     }
 
@@ -127,7 +133,9 @@ impl InvertedIndex {
     /// Empty posting lists are pruned to avoid unbounded memory growth.
     pub fn remove(&mut self, file_id: FileId) {
         self.map.retain(|_, ids| {
-            ids.remove(&file_id);
+            if ids.contains(&file_id) {
+                Arc::make_mut(ids).remove(&file_id);
+            }
             !ids.is_empty()
         });
     }
@@ -155,7 +163,7 @@ impl InvertedIndex {
     /// Returns 0 if the token is absent.
     #[must_use]
     pub fn posting_count(&self, token: &Token) -> usize {
-        self.map.get(token).map_or(0, HashSet::len)
+        self.map.get(token).map_or(0, |ids| ids.len())
     }
 }
 
@@ -168,6 +176,27 @@ mod tests {
 
     fn fid(index: u32, r#gen: u32) -> FileId {
         FileId::new_for_testing(index, r#gen)
+    }
+
+    /// A clone shares its sets with the original: a change on either side
+    /// must never show on the other.
+    #[test]
+    fn a_clone_and_its_original_change_independently() {
+        let mut live = InvertedIndex::new();
+        live.insert(fid(0, 0), &tokenize("src/http/client.rs"));
+        live.insert(fid(1, 0), &tokenize("src/http/server.rs"));
+        let before = live.clone();
+
+        let mut staged = live.clone();
+        staged.insert(fid(2, 0), &tokenize("src/http/router.rs"));
+        staged.remove(fid(0, 0));
+        assert_eq!(live, before);
+        assert_eq!(staged.posting_count(&Token::new("http")), 2);
+        assert_eq!(staged.query(&Token::new("client")).count(), 0);
+
+        live.remove(fid(1, 0));
+        assert_eq!(staged.posting_count(&Token::new("server")), 1);
+        assert_eq!(live.posting_count(&Token::new("http")), 1);
     }
 
     fn tok(s: &str) -> Token {
