@@ -2284,6 +2284,71 @@ async fn connect_or_spawn_without_configured_budget_initializes() {
     .await;
 }
 
+#[tokio::test]
+async fn auto_spawned_daemon_loads_extensions_from_client_extensions_dir() {
+    use core_engine::adapters::daemon::client::connect_or_spawn_with_extensions_dir;
+
+    let workspace = tempdir().unwrap();
+    let extensions = tempdir().unwrap();
+    let hello_dir = extensions.path().join("hello");
+    fs::create_dir_all(&hello_dir).unwrap();
+    let binary = workspace_root()
+        .join("target/debug/hello_extension")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let manifest = fs::read_to_string(workspace_root().join("extensions/hello/extension.toml"))
+        .expect("read shipped hello manifest")
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("command") {
+                format!("command = [\"{binary}\"]")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(hello_dir.join("extension.toml"), manifest).unwrap();
+
+    core_engine::adapters::daemon::client::register_test_daemon_exe(std::path::Path::new(env!(
+        "CARGO_BIN_EXE_tower"
+    )));
+    let _conn = connect_or_spawn_with_extensions_dir(workspace.path(), Some(extensions.path()))
+        .await
+        .expect("connect-or-spawn");
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let loaded = loop {
+        let status = core_engine::adapters::daemon::client::send_control_async(
+            &opts,
+            ControlRequest::Status,
+        )
+        .await;
+        if let Ok(ControlResponse::Status(s)) = &status
+            && !s.extensions.is_empty()
+        {
+            break s.extensions.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "auto-spawned daemon never loaded the client's --extensions-dir: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        loaded.iter().any(|tool| tool == "greet"),
+        "expected the hello extension's greet tool, got {loaded:?}"
+    );
+
+    let _ =
+        core_engine::adapters::daemon::client::send_control_async(&opts, ControlRequest::Shutdown)
+            .await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_lint_explicit_timeout_precedes_small_global_deadline() {

@@ -417,7 +417,10 @@ fn daemon_exe() -> std::io::Result<std::path::PathBuf> {
 }
 
 /// Spawn a detached `tower daemon --detach` for `workspace_root`.
-fn spawn_daemon(workspace_root: &Path) -> std::io::Result<std::process::Child> {
+fn spawn_daemon(
+    workspace_root: &Path,
+    extensions_dir: Option<&Path>,
+) -> std::io::Result<std::process::Child> {
     let exe = daemon_exe()?;
     let log_path = log_path(workspace_root);
     if let Some(parent) = log_path.parent() {
@@ -428,11 +431,16 @@ fn spawn_daemon(workspace_root: &Path) -> std::io::Result<std::process::Child> {
         .append(true)
         .open(log_path)?;
     let log2 = log.try_clone()?;
-    std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("daemon")
         .arg("--detach")
         .arg("--workspace-dir")
-        .arg(workspace_root)
+        .arg(workspace_root);
+    if let Some(extensions_dir) = extensions_dir {
+        command.arg("--extensions-dir").arg(extensions_dir);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2))
@@ -473,20 +481,35 @@ pub(crate) async fn connect_or_spawn_with_deadline(
 
 /// Ordinary connections retain their optional local budget and I/O error contract.
 pub async fn connect_or_spawn(workspace_root: &Path) -> std::io::Result<UnixStream> {
+    connect_or_spawn_with_extensions_dir(workspace_root, None).await
+}
+
+/// [`connect_or_spawn`], forwarding `--extensions-dir` to a daemon this call spawns.
+/// A daemon already running keeps the extension dirs it was started with.
+pub async fn connect_or_spawn_with_extensions_dir(
+    workspace_root: &Path,
+    extensions_dir: Option<&Path>,
+) -> std::io::Result<UnixStream> {
     let timeout = config::load(workspace_root)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?
         .daemon
         .connection_timeout();
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-    acquire_daemon_socket(workspace_root, ConnectionWait::Local { deadline })
-        .await
-        .map_err(|error| match error {
-            AvailabilityWaitError::Inner(source) => source,
-            AvailabilityWaitError::Timeout => connection_timeout_error(),
-            AvailabilityWaitError::Cancelled => {
-                unreachable!("local connections have no cancellation signal")
-            }
-        })
+    acquire_daemon_socket(
+        workspace_root,
+        ConnectionWait::Local {
+            deadline,
+            extensions_dir,
+        },
+    )
+    .await
+    .map_err(|error| match error {
+        AvailabilityWaitError::Inner(source) => source,
+        AvailabilityWaitError::Timeout => connection_timeout_error(),
+        AvailabilityWaitError::Cancelled => {
+            unreachable!("local connections have no cancellation signal")
+        }
+    })
 }
 
 /// Only the external path bounds each I/O stage; local retry timing stays compatible.
@@ -494,6 +517,7 @@ pub async fn connect_or_spawn(workspace_root: &Path) -> std::io::Result<UnixStre
 enum ConnectionWait<'a> {
     Local {
         deadline: Option<tokio::time::Instant>,
+        extensions_dir: Option<&'a Path>,
     },
     External {
         deadline: tokio::time::Instant,
@@ -517,7 +541,7 @@ impl ConnectionWait<'_> {
 
     async fn retry(self) -> Result<(), AvailabilityWaitError<std::io::Error>> {
         match self {
-            Self::Local { deadline } => {
+            Self::Local { deadline, .. } => {
                 if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                     return Err(AvailabilityWaitError::Timeout);
                 }
@@ -554,12 +578,12 @@ impl ConnectionWait<'_> {
     ) -> Result<std::process::Child, AvailabilityWaitError<std::io::Error>> {
         self.io(async {
             match self {
-                Self::Local { .. } => spawn_daemon(workspace_root),
+                Self::Local { extensions_dir, .. } => spawn_daemon(workspace_root, extensions_dir),
                 Self::External { .. } => {
                     #[cfg(test)]
                     test_stage_pause(workspace_root, "spawn").await;
                     let root = workspace_root.to_path_buf();
-                    tokio::task::spawn_blocking(move || spawn_daemon(&root))
+                    tokio::task::spawn_blocking(move || spawn_daemon(&root, None))
                         .await
                         .map_err(std::io::Error::other)?
                 }
@@ -698,9 +722,10 @@ pub fn run_mcp_client(opts: &GlobalOpts) -> Result<(), String> {
         .build()
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
     rt.block_on(async {
-        let stream = connect_or_spawn(&workspace_root)
-            .await
-            .map_err(|e| format!("failed to reach tower daemon: {e}"))?;
+        let stream =
+            connect_or_spawn_with_extensions_dir(&workspace_root, opts.extensions_dir.as_deref())
+                .await
+                .map_err(|e| format!("failed to reach tower daemon: {e}"))?;
         relay_mcp(stream)
             .await
             .map_err(|e| format!("relay error: {e}"))
@@ -758,13 +783,18 @@ mod connection_error_tests {
 
     #[tokio::test]
     async fn invalid_socket_probe_does_not_spawn_a_daemon() {
-        // The invalid name cannot denote an absent/refused Unix socket. A
-        // spawn attempt would create .tower/daemon.log under this workspace.
+        // A socket path that loops (ELOOP) is neither an absent nor a refused
+        // Unix socket. A spawn attempt would create .tower/daemon.log under
+        // this workspace. (An over-long path no longer works here: it moves
+        // to $XDG_RUNTIME_DIR, see `socket_path`.)
         let workspace = tempfile::tempdir().unwrap();
-        let invalid = workspace.path().join("x".repeat(200));
-        assert!(super::connect_or_spawn(&invalid).await.is_err());
-        assert!(!invalid.join(".tower/daemon.log").exists());
-        assert!(!invalid.join(".tower/daemon.lock").exists());
+        let tower = workspace.path().join(".tower");
+        std::fs::create_dir(&tower).unwrap();
+        std::os::unix::fs::symlink("daemon.sock", tower.join("daemon.sock")).unwrap();
+        assert!(super::connect_or_spawn(workspace.path()).await.is_err());
+        assert!(!tower.join("daemon.log").exists());
+        assert!(!tower.join("daemon.lock").exists());
+        assert!(tower.join("daemon.sock").symlink_metadata().is_ok());
     }
 }
 
