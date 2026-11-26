@@ -196,6 +196,10 @@ impl ReaderExit {
     }
 }
 
+/// How long a write that hit a broken pipe waits for the reader to report
+/// the server's exit.
+const BROKEN_PIPE_EXIT_WAIT: Duration = Duration::from_millis(500);
+
 fn classify_reader_error(error: &std::io::Error) -> ReaderExit {
     match error.kind() {
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
@@ -1398,7 +1402,7 @@ impl LspClientAdapter {
             return Err(if error.kind() == std::io::ErrorKind::TimedOut {
                 LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
             } else {
-                self.transport_failure()
+                self.transport_failure(&error)
             });
         }
         Ok(emitted_sync)
@@ -1486,7 +1490,7 @@ impl LspClientAdapter {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
             } else {
-                self.transport_failure()
+                self.transport_failure(&error)
             }
         })?;
 
@@ -1539,7 +1543,19 @@ impl LspClientAdapter {
         }
     }
 
-    fn transport_failure(&self) -> LspSessionError {
+    /// The outcome of a failed write. A broken pipe means the server is gone:
+    /// its reader sees the end of its output right after, so wait briefly for
+    /// it to classify the exit instead of racing it.
+    fn transport_failure(&self, error: &std::io::Error) -> LspSessionError {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            let (lock, cvar) = &*self.state;
+            let state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = cvar
+                .wait_timeout_while(state, BROKEN_PIPE_EXIT_WAIT, |_| {
+                    !self.dead_flag.load(Ordering::Acquire)
+                })
+                .unwrap_or_else(|p| p.into_inner());
+        }
         if self.dead_flag.load(Ordering::Acquire) {
             self.reader_failure()
         } else {
@@ -2096,7 +2112,7 @@ impl pool::PooledSession for LspClientAdapter {
                 return Err(if error.kind() == std::io::ErrorKind::TimedOut {
                     LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
                 } else {
-                    self.transport_failure()
+                    self.transport_failure(&error)
                 });
             }
             emitted_sync
