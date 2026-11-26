@@ -681,6 +681,11 @@ impl SledStorageAdapter {
 
 impl StoragePort for SledStorageAdapter {
     fn apply_reconciliation_delta(&mut self, delta: &ReconciliationDelta) -> Result<(), PortError> {
+        // Nothing to write: no transaction, no flush. Every write to the
+        // database is a filesystem event the watcher sees.
+        if delta.is_empty() {
+            return Ok(());
+        }
         let additions =
             prepare_reconciliation_additions(delta).map_err(reconciliation_port_error)?;
 
