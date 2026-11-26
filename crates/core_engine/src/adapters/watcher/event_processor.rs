@@ -113,6 +113,8 @@ pub struct EventProcessor {
     watcher_cancelled: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     before_commit: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    stagings: usize,
 }
 
 impl std::fmt::Debug for EventProcessor {
@@ -164,6 +166,8 @@ impl EventProcessor {
             watcher_cancelled: None,
             #[cfg(test)]
             before_commit: None,
+            #[cfg(test)]
+            stagings: 0,
         }
     }
 
@@ -232,6 +236,12 @@ impl EventProcessor {
         if !self.coordinate_event(&event)? {
             return Ok(());
         }
+        // After coordination, which may consume a registered echo: an event
+        // on shadow files alone changes nothing, and atomic writes make three
+        // of them per write.
+        if self.is_shadow_event(&event) {
+            return Ok(());
+        }
         let Some(publisher) = self.publication.clone() else {
             return self.apply_event(event);
         };
@@ -256,6 +266,10 @@ impl EventProcessor {
                 .snapshot();
             let staged_workspace =
                 ProjectWorkspace::from_snapshot(snapshot).expect("valid live workspace snapshot");
+            #[cfg(test)]
+            {
+                self.stagings += 1;
+            }
             let mut staged_index = InvertedIndex::new();
             for file in staged_workspace.snapshot().files {
                 staged_index.insert(file.id, &tokenize(file.path.as_str()));
@@ -1005,9 +1019,6 @@ impl EventProcessor {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Convert an absolute path to a workspace-relative [`RelativePath`].
-    ///
-    /// Returns `None` if the path is outside the workspace root (UN1/AC5).
     /// Whether every path of `event` is in the workspace's `.tower/`
     /// directory (the daemon's database, socket, logs and config): a rename
     /// out of it still counts, as it brings a file into the workspace.
@@ -1026,6 +1037,32 @@ impl EventProcessor {
         }
     }
 
+    /// Whether every path of `event` is a shadow-write artifact the workspace
+    /// does not hold. The handlers ignore those (a delete of one removes
+    /// nothing), so the event can skip staging a copy of the workspace.
+    fn is_shadow_event(&self, event: &WatchEvent) -> bool {
+        let is_shadow = |abs: &Path| {
+            self.to_relative(abs).is_some_and(|rel| {
+                is_tmp_artifact(&rel)
+                    && self
+                        .workspace
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_by_path(&rel)
+                        .is_none()
+            })
+        };
+        match event {
+            WatchEvent::Create(path) | WatchEvent::Modify(path) | WatchEvent::Delete(path) => {
+                is_shadow(path)
+            }
+            WatchEvent::Rename { from, to } => is_shadow(from) && is_shadow(to),
+        }
+    }
+
+    /// Convert an absolute path to a workspace-relative [`RelativePath`].
+    ///
+    /// Returns `None` if the path is outside the workspace root (UN1/AC5).
     fn to_relative(&self, abs: &Path) -> Option<RelativePath> {
         let rel = abs.strip_prefix(&self.root).ok()?;
         let rel_str = rel.to_str()?;
@@ -2099,6 +2136,74 @@ mod tests {
         std::fs::write(&source, b"fn f() {}").unwrap();
         processor.process_event(WatchEvent::Create(source)).unwrap();
         assert_eq!(calls.lock().unwrap().attempts, 1);
+    }
+
+    /// Atomic writes make three events on their shadow files for one on the
+    /// real path. The shadow-only ones change nothing, so they are dropped
+    /// before staging a copy of the workspace; the rename onto the real path
+    /// and a rename of a real file onto a shadow name are still processed.
+    #[test]
+    fn drops_events_that_only_touch_unindexed_shadow_files() {
+        let holds = |processor: &EventProcessor, path: &RelativePath| {
+            processor
+                .workspace
+                .read()
+                .unwrap()
+                .get_by_path(path)
+                .is_some()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let shadow = root.path().join("lib.rs.tmp_write");
+        let inner = root.path().join("lib.rs.tmp_write.~tmp");
+        let source = root.path().join("lib.rs");
+        std::fs::write(&shadow, b"fn f() {}").unwrap();
+        let (mut processor, _) = counting_processor(root.path());
+        for event in [
+            WatchEvent::Create(inner.clone()),
+            WatchEvent::Modify(inner.clone()),
+            WatchEvent::Rename {
+                from: inner.clone(),
+                to: shadow.clone(),
+            },
+            WatchEvent::Delete(inner),
+        ] {
+            processor.process_event(event).unwrap();
+        }
+        assert_eq!(processor.stagings, 0);
+
+        std::fs::rename(&shadow, &source).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: shadow,
+                to: source.clone(),
+            })
+            .unwrap();
+        let path = RelativePath::new("lib.rs");
+        assert!(holds(&processor, &path));
+
+        let moved = root.path().join("lib.rs.~tmp");
+        std::fs::rename(&source, &moved).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: moved,
+            })
+            .unwrap();
+        assert!(!holds(&processor, &path));
+        assert_eq!(processor.stagings, 2);
+
+        // A shadow name the workspace does hold is still removed.
+        let held = RelativePath::new("held.rs.~tmp");
+        processor
+            .workspace
+            .write()
+            .unwrap()
+            .insert(held.clone(), FileMetadata::default())
+            .unwrap();
+        processor
+            .process_event(WatchEvent::Delete(root.path().join("held.rs.~tmp")))
+            .unwrap();
+        assert!(!holds(&processor, &held));
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
