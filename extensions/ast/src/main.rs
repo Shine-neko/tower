@@ -24,7 +24,8 @@
 //! - One in-memory [`SymbolIndex`] and content-hash dedup map, guarded by
 //!   `std::sync::Mutex` (the protocol is serial per-extension; no concurrency needed).
 //! - `fileIndexed`/`fileChanged`: host_call `workspace/readFile` → tree-sitter parse
-//!   → update index via `index/put`.
+//!   → update the in-memory index, persisted via `index/put` in batches (see
+//!   [`persist`]).
 //! - Tools: read from the in-process `SymbolIndex`; `get_outline`/`find_symbols`/
 //!   `read_symbol` call `workspace/readFile` for per-file operations.
 //! - `reindex`: calls `workspace/listFiles` + per-file `workspace/readFile`, rebuilds
@@ -40,6 +41,7 @@
 
 mod index;
 mod outline;
+mod persist;
 mod protocol;
 mod symbols;
 mod text;
@@ -48,6 +50,7 @@ mod tools;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use extension_protocol::{
     Capability, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response, ToolDecl,
@@ -70,6 +73,7 @@ fn main() {
     // Incremental host-call id counter (must not collide with request ids from host).
     // We use ids starting at 10_000 to be well clear of low host request ids.
     let mut next_hcall_id: u64 = 10_000;
+    let mut persistence = persist::Persistence::new(Instant::now());
 
     while let Some(Ok(line)) = lines.next() {
         let line = line.trim().to_owned();
@@ -272,6 +276,18 @@ fn main() {
                     )
                 };
 
+                // Caught up with every event delivered: persist what is left.
+                let settled = result.as_ref().is_ok_and(|v| {
+                    v.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+                });
+                persist_if_due(
+                    &mut persistence,
+                    &index,
+                    settled,
+                    &mut out,
+                    &mut lines,
+                    &mut next_hcall_id,
+                );
                 match result {
                     Ok(value) => {
                         protocol::send_response(&mut out, &id, &Response::ToolResult(value));
@@ -319,10 +335,26 @@ fn main() {
                     processed_events = processed_events.saturating_add(1);
                 }
 
+                persist_if_due(
+                    &mut persistence,
+                    &index,
+                    false,
+                    &mut out,
+                    &mut lines,
+                    &mut next_hcall_id,
+                );
                 protocol::send_response(&mut out, &id, &Response::Ack);
             }
 
             "shutdown" => {
+                persist_if_due(
+                    &mut persistence,
+                    &index,
+                    true,
+                    &mut out,
+                    &mut lines,
+                    &mut next_hcall_id,
+                );
                 protocol::send_response(&mut out, &id, &Response::Ack);
                 let _ = out.flush();
                 break;
@@ -335,6 +367,32 @@ fn main() {
 
         let _ = out.flush();
     }
+}
+
+/// Persists the index with an `index/put` HostCall when [`persist`]'s
+/// policy says so. Called inside a request turn, before its response.
+fn persist_if_due<W, R>(
+    persistence: &mut persist::Persistence,
+    index: &Mutex<SymbolIndex>,
+    settled: bool,
+    out: &mut W,
+    lines: &mut R,
+    next_id: &mut u64,
+) where
+    W: Write,
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let now = Instant::now();
+    let bytes = {
+        let mut index = index.lock().unwrap();
+        if !persistence.due(index.unpersisted_changes(), now, settled) {
+            return;
+        }
+        index.persist()
+    };
+    // Released the lock before the host call.
+    let _ = protocol::host_call_index_put(out, lines, next_id, "ast/symbols", bytes);
+    persistence.persisted(now);
 }
 
 /// Extract the `path` field from a `deliverEvent` params value.

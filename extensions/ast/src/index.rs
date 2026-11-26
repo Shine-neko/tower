@@ -50,12 +50,37 @@ impl SymbolEntry {
 // ── SymbolIndex ───────────────────────────────────────────────────────────────
 
 /// Cross-file symbol index backed by `BTreeMap<path, entries>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SymbolIndex {
     pub by_path: BTreeMap<String, Vec<SymbolEntry>>,
+    /// Changes since the index was last persisted (or loaded): not
+    /// persisted, and not part of the index's value.
+    #[serde(skip)]
+    unpersisted: u64,
 }
 
+impl PartialEq for SymbolIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.by_path == other.by_path
+    }
+}
+
+impl Eq for SymbolIndex {}
+
 impl SymbolIndex {
+    /// Changes made since the index was last persisted.
+    #[must_use]
+    pub fn unpersisted_changes(&self) -> u64 {
+        self.unpersisted
+    }
+
+    /// Serializes the index for `index/put` and counts it as persisted.
+    #[must_use]
+    pub fn persist(&mut self) -> Vec<u8> {
+        self.unpersisted = 0;
+        self.to_bytes()
+    }
+
     /// Replace all index entries for `path` with the symbols in `outline`.
     pub fn index_file(&mut self, path: &str, outline: &Outline) {
         let entries: Vec<SymbolEntry> = outline
@@ -64,11 +89,14 @@ impl SymbolIndex {
             .map(|item| entry_from_item(path, item))
             .collect();
         self.by_path.insert(path.to_owned(), entries);
+        self.unpersisted = self.unpersisted.saturating_add(1);
     }
 
     /// Remove all index entries for `path`.
     pub fn remove_file(&mut self, path: &str) {
-        self.by_path.remove(path);
+        if self.by_path.remove(path).is_some() {
+            self.unpersisted = self.unpersisted.saturating_add(1);
+        }
     }
 
     /// Search for symbols with `name` and optional `kind` filter.
