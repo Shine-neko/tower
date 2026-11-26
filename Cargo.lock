@@ -407,6 +407,7 @@ dependencies = [
  "fixture_lsp_server",
  "gag",
  "ignore",
+ "memchr",
  "notify",
  "postcard",
  "proptest",
